@@ -1,10 +1,252 @@
-language: node_js
-node_js:
-  - "8"
-cache: yarn
+# .travis.yml - расширенная версия
+dist: focal  # Ubuntu 20.04 Focal Fossa
+language: c
+
+# Матрица сборок
+matrix:
+  include:
+    # Основные сборки
+    - os: linux
+      compiler: gcc
+      env: 
+        - BUILD_TYPE=Debug
+        - SANITIZERS=ON
+        - NAME="Linux GCC Debug with Sanitizers"
+    
+    - os: linux
+      compiler: gcc
+      env: 
+        - BUILD_TYPE=Release
+        - NAME="Linux GCC Release"
+    
+    - os: linux
+      compiler: clang
+      env: 
+        - BUILD_TYPE=Debug
+        - CC=clang
+        - CXX=clang++
+        - NAME="Linux Clang Debug"
+    
+    - os: osx
+      osx_image: xcode12.5  # Конкретная версия macOS
+      compiler: clang
+      env: 
+        - BUILD_TYPE=Release
+        - NAME="macOS Clang Release"
+    
+    # Сборка с покрытием кода
+    - os: linux
+      compiler: gcc
+      env: 
+        - BUILD_TYPE=Debug
+        - COVERAGE=ON
+        - NAME="Linux GCC Coverage"
+    
+    # 32-битная сборка
+    - os: linux
+      compiler: gcc
+      addons:
+        apt:
+          packages:
+            - gcc-multilib
+      env: 
+        - BUILD_TYPE=Release
+        - CFLAGS="-m32"
+        - LDFLAGS="-m32"
+        - NAME="Linux GCC 32-bit"
+
+# Дополнения для apt (только для Linux)
+addons:
+  apt:
+    packages:
+      - cmake
+      - lcov
+      - cppcheck
+      - valgrind
+      - graphviz
+      - doxygen
+      - python3-pip
+    update: true
+
+# Кэширование
+cache:
+  apt: true
+  directories:
+    - $HOME/.cache
+    - $HOME/.ccache
+    - $HOME/.local
+
+# Установка зависимостей
+before_install:
+  # Информация о системе
+  - echo "Travis CI Job: $NAME"
+  - echo "OS: $TRAVIS_OS_NAME"
+  - echo "Build Type: $BUILD_TYPE"
+  
+  # Установка дополнительных инструментов
+  - |
+    if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then
+      # Установка gcovr для отчетов о покрытии
+      pip3 install --user gcovr
+    fi
+  
+  # Установка для macOS
+  - |
+    if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then
+      brew install gcovr
+    fi
+  
+  # Вывод версий
+  - $CC --version
+  - cmake --version
+  - cppcheck --version || echo "cppcheck not installed"
+  - valgrind --version || echo "valgrind not installed"
+
+# Основные шаги
+install:
+  - echo "No additional installation needed"
+
+# Скрипт сборки и тестирования
 script:
-  - echo 'Build starts!!'
-  - echo 'Installing Deps!'
-  - yarn
-  - echo 'Testing!'
-  - npm run test:prod
+  # Статический анализ
+  - echo "=== Running Static Analysis ==="
+  - |
+    cppcheck --enable=all \
+             --inconclusive \
+             --suppress=missingIncludeSystem \
+             --std=c11 \
+             --error-exitcode=0 \
+             --quiet \
+             *.c *.h || true
+  
+  # Подготовка директории сборки
+  - mkdir -p build
+  - cd build
+  
+  # Конфигурация CMake
+  - echo "=== Configuring CMake ==="
+  - |
+    CMAKE_ARGS="-DCMAKE_BUILD_TYPE=$BUILD_TYPE"
+    
+    if [[ "$SANITIZERS" == "ON" ]]; then
+      CMAKE_ARGS="$CMAKE_ARGS -DENABLE_SANITIZERS=ON"
+    fi
+    
+    if [[ "$COVERAGE" == "ON" ]]; then
+      CMAKE_ARGS="$CMAKE_ARGS -DENABLE_COVERAGE=ON"
+    fi
+    
+    if [[ "$CC" == "clang" ]]; then
+      CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_C_COMPILER=clang"
+    fi
+    
+    cmake .. $CMAKE_ARGS
+  
+  # Сборка
+  - echo "=== Building ==="
+  - cmake --build . --config $BUILD_TYPE
+  
+  # Запуск тестов
+  - echo "=== Running Tests ==="
+  - ./stack_test
+  
+  # Проверка утечек памяти с Valgrind
+  - echo "=== Memory Leak Check ==="
+  - valgrind --leak-check=full --error-exitcode=1 ./stack_test 2>&1 | tail -20 || true
+  
+  # Проверка основной программы
+  - echo "=== Running Main Program ==="
+  - ./main
+  
+  # Бенчмарки
+  - echo "=== Running Benchmarks ==="
+  - |
+    if [[ -f "./benchmark" ]]; then
+      time ./benchmark
+    fi
+
+# После выполнения тестов
+after_success:
+  # Генерация отчета о покрытии
+  - |
+    if [[ "$COVERAGE" == "ON" ]]; then
+      echo "=== Generating Coverage Report ==="
+      cd build
+      
+      # Генерация отчетов lcov
+      lcov --capture --directory . --output-file coverage.info
+      lcov --remove coverage.info '/usr/*' '*/test_*' --output-file coverage.info
+      lcov --list coverage.info
+      
+      # Генерация HTML отчета
+      genhtml coverage.info --output-directory coverage_report
+      
+      # Генерация отчета gcovr
+      gcovr --html-details coverage_report.html --print-summary
+      
+      # Вывод краткой информации
+      echo "Coverage report generated in coverage_report/"
+    fi
+  
+  # Документация (если есть Doxygen)
+  - |
+    if [[ -f "../Doxyfile" ]]; then
+      echo "=== Generating Documentation ==="
+      doxygen ../Doxyfile
+    fi
+
+# После неудачи
+after_failure:
+  - echo "=== Build Failed ==="
+  - echo "Last 50 lines of build log:"
+  - tail -50 /tmp/travis.log || true
+
+# Развертывание отчетов
+deploy:
+  # Развертывание отчета о покрытии на GitHub Pages
+  - provider: pages
+    skip_cleanup: true
+    github_token: $GITHUB_TOKEN
+    local_dir: build/coverage_report
+    target_branch: gh-pages
+    on:
+      branch: main
+      condition: $COVERAGE = ON
+  
+  # Развертывание документации
+  - provider: pages
+    skip_cleanup: true
+    github_token: $GITHUB_TOKEN
+    local_dir: docs/html
+    target_branch: gh-pages-docs
+    on:
+      branch: main
+      condition: -f "../Doxyfile"
+
+# Уведомления
+notifications:
+  email:
+    recipients:
+      - your-email@example.com
+    on_success: change  # Только при изменении статуса
+    on_failure: always  # Всегда при неудаче
+  
+  # Slack уведомления (опционально)
+  slack:
+    rooms:
+      - secure: "ENCRYPTED_SLACK_WEBHOOK_URL"
+    on_success: change
+    on_failure: always
+    template:
+      - "Build <%{build_url}|#%{build_number}> (%{branch}) of %{repository}@%{commit} %{result} in %{duration}"
+      - "Author: %{author}"
+      - "Message: %{message}"
+
+# Переменные окружения (секреты)
+env:
+  global:
+    # Зашифрованный токен для GitHub
+    - secure: "YOUR_ENCRYPTED_GITHUB_TOKEN"
+    
+    # Для Codecov (если используется)
+    - CODECOV_TOKEN: "your-codecov-token-here"
